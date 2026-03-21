@@ -38,5 +38,36 @@ app.post("/webhook", async (req, res) => {
 
   res.sendStatus(200);
 });
+app.post("/verificar-licenca", async (req, res) => {
 
+  const { license_key, device_id } = req.body
+
+  const { data, error } = await supabase
+    .from("licenses")
+    .select("*")
+    .eq("license_key", license_key)
+    .single()
+
+  if(error || !data){
+    return res.json({ valido: false })
+  }
+
+  // 🔥 se ainda não tem device → vincula
+  if(!data.device_id){
+
+    await supabase
+      .from("licenses")
+      .update({ device_id })
+      .eq("license_key", license_key)
+
+    return res.json({ valido: true })
+  }
+
+  // 🔒 se já tem device → verifica
+  if(data.device_id !== device_id){
+    return res.json({ valido: false })
+  }
+
+  return res.json({ valido: true })
+})
 app.listen(3000, () => console.log("Servidor rodando na porta 3000"));
