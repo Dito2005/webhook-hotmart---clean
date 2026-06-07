@@ -1,135 +1,147 @@
+
 const express = require("express");
 const fetch = require("node-fetch");
-const nodemailer = require("nodemailer");
+const { Resend } = require("resend");
 
 const app = express();
 app.use(express.json());
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const SUPABASE_KEY = process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-// 🔥 WEBHOOK HOTMART
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+function gerarLicenca() {
+  return "LIC-" + Math.random().toString(36).substring(2, 10).toUpperCase();
+}
+
 app.post("/webhook", async (req, res) => {
-
-  const data = req.body;
-
-  // ⚡ RESPONDE IMEDIATO (EVITA ERRO 408)
   res.sendStatus(200);
 
   try {
+    const data = req.body;
 
-    console.log("Recebido:", data);
+    console.log("Webhook recebido:", JSON.stringify(data));
 
-    if (data.event === "PURCHASE_APPROVED") {
-
-      const email = data.data.buyer.email;
-
-      const license = "LIC-" + Math.random().toString(36).substring(2, 10).toUpperCase();
-
-      // 💾 SALVAR NO SUPABASE
-      await fetch(`${SUPABASE_URL}/rest/v1/licenses`, {
-        method: "POST",
-        headers: {
-          "apikey": SUPABASE_KEY,
-          "Authorization": `Bearer ${SUPABASE_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          license_key: license,
-          status: "active",
-          email: email
-        })
-      });
-
-      console.log("✅ Licença criada:", license);
-
-      // 📧 ENVIAR EMAIL (SEM TRAVAR O WEBHOOK)
-      try {
-
-        const transporter = nodemailer.createTransport({
-          service: "gmail",
-          auth: {
-            user: process.env.EMAIL_USER,
-            pass: process.env.EMAIL_PASS
-          }
-        });
-
-        await transporter.sendMail({
-          from: process.env.EMAIL_USER,
-          to: email,
-          subject: "Sua licença - Presell Studio",
-          html: `
-            <h2>Compra confirmada!</h2>
-            <p>Sua licença:</p>
-            <b>${license}</b>
-          `
-        });
-
-        console.log("📧 Email enviado para:", email);
-
-      } catch (err) {
-        console.log("❌ Erro ao enviar email:", err.message);
-      }
-
+    if (data.event !== "PURCHASE_APPROVED") {
+      console.log("Evento ignorado:", data.event);
+      return;
     }
 
-  } catch (err) {
-    console.log("❌ Erro geral:", err.message);
-  }
+    const email = data?.data?.buyer?.email;
 
-});
-
-// 🔐 VERIFICAR LICENÇA
-app.post("/verificar-licenca", async (req, res) => {
-
-  const { license_key, device_id } = req.body;
-
-  const response = await fetch(
-    `${SUPABASE_URL}/rest/v1/licenses?license_key=eq.${license_key}`,
-    {
-      headers: {
-        "apikey": SUPABASE_KEY,
-        "Authorization": `Bearer ${SUPABASE_KEY}`
-      }
+    if (!email) {
+      console.log("Email do comprador não encontrado no payload");
+      return;
     }
-  );
 
-  const data = await response.json();
+    const license = gerarLicenca();
 
-  if (!data || data.length === 0) {
-    return res.json({ valido: false });
-  }
-
-  const lic = data[0];
-
-  // 🔗 PRIMEIRO ACESSO → VINCULA DEVICE
-  if (!lic.device_id) {
-
-    await fetch(`${SUPABASE_URL}/rest/v1/licenses?license_key=eq.${license_key}`, {
-      method: "PATCH",
+    const supabaseResponse = await fetch(`${SUPABASE_URL}/rest/v1/licenses`, {
+      method: "POST",
       headers: {
-        "apikey": SUPABASE_KEY,
-        "Authorization": `Bearer ${SUPABASE_KEY}`,
-        "Content-Type": "application/json"
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "return=representation"
       },
-      body: JSON.stringify({ device_id })
+      body: JSON.stringify({
+        license_key: license,
+        status: "active",
+        email: email
+      })
     });
 
-    console.log("🔗 Device vinculado");
+    const supabaseText = await supabaseResponse.text();
 
-    return res.json({ valido: true });
+    if (!supabaseResponse.ok) {
+      console.log("Erro ao criar licença no Supabase:", supabaseText);
+      return;
+    }
+
+    console.log("Licença criada:", license, "para:", email);
+
+    const emailResult = await resend.emails.send({
+      from: process.env.RESEND_FROM,
+      to: email,
+      subject: "Sua licença - Presell Studio",
+      html: `
+        <h2>Compra confirmada!</h2>
+        <p>Obrigado por comprar o Presell Studio.</p>
+        <p>Sua chave de licença é:</p>
+        <h3>${license}</h3>
+      `
+    });
+
+    if (emailResult.error) {
+      console.log("Erro ao enviar email pelo Resend:", emailResult.error);
+      return;
+    }
+
+    console.log("Email enviado pelo Resend para:", email);
+  } catch (err) {
+    console.log("Erro geral no webhook:", err.message);
   }
-
-  // ❌ DEVICE DIFERENTE
-  if (lic.device_id !== device_id) {
-    return res.json({ valido: false });
-  }
-
-  // ✅ OK
-  return res.json({ valido: true });
 });
 
-// 🚀 START SERVER
+app.post("/verificar-licenca", async (req, res) => {
+  try {
+    const { license_key, device_id } = req.body;
+
+    if (!license_key || !device_id) {
+      return res.json({ valido: false });
+    }
+
+    const response = await fetch(
+      `${SUPABASE_URL}/rest/v1/licenses?license_key=eq.${encodeURIComponent(license_key)}`,
+      {
+        headers: {
+          apikey: SUPABASE_KEY,
+          Authorization: `Bearer ${SUPABASE_KEY}`
+        }
+      }
+    );
+
+    const data = await response.json();
+
+    if (!data || data.length === 0) {
+      return res.json({ valido: false });
+    }
+
+    const lic = data[0];
+
+    if (lic.status !== "active") {
+      return res.json({ valido: false });
+    }
+
+    if (!lic.device_id) {
+      await fetch(
+        `${SUPABASE_URL}/rest/v1/licenses?license_key=eq.${encodeURIComponent(license_key)}`,
+        {
+          method: "PATCH",
+          headers: {
+            apikey: SUPABASE_KEY,
+            Authorization: `Bearer ${SUPABASE_KEY}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ device_id })
+        }
+      );
+
+      return res.json({ valido: true });
+    }
+
+    if (lic.device_id !== device_id) {
+      return res.json({ valido: false });
+    }
+
+    return res.json({ valido: true });
+  } catch (err) {
+    console.log("Erro ao verificar licença:", err.message);
+    return res.json({ valido: false });
+  }
+});
+
 app.listen(process.env.PORT || 3000, () => {
-  console.log("🚀 Servidor rodando na porta", process.env.PORT || 3000);
+  console.log("Servidor rodando na porta", process.env.PORT || 3000);
 });
